@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _RST, _BOLD, _DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
 _RED = "\x1b[38;2;239;83;80m"
+# Fixed mid-grey for reasoning: SGR dim renders too faint to read on some terminal themes.
+_REASONING_GREY = "#9A9A9A"
 
 
 def is_modern(cli) -> bool:
@@ -112,18 +114,18 @@ def answer_label(timestamp: str = "") -> str:
 
 
 def thought_line(seconds: float | None) -> str:
-    """``∴ Thought for 3s`` (dim italic), closing a reasoning block. No title: the reasoning is
+    """``∴ Thought for 3s`` (grey italic), closing a reasoning block. No title: the reasoning is
     printed right above, so any excerpt of it would repeat what the user just read."""
     took = t("cli.modern.thought_for", seconds=f"{max(seconds or 0.0, 0.0):.0f}") if seconds else t("cli.modern.thought")
-    return f"\x1b[2;3m∴ {took}{_RST}"
+    return f"{_fg(_REASONING_GREY)}\x1b[3m∴ {took}{_RST}"
 
 
 _REASONING_PREVIEW_LINES = 10  # classic's post-hoc reasoning box shows this many unless /reasoning full
 
 
 def reasoning_text_line(line: str) -> str:
-    """One streamed reasoning line: dim, no frame (the dim bar above opens the block)."""
-    return f"{_DIM}{line}{_RST}"
+    """One streamed reasoning line: grey, no frame (the grey bar above opens the block)."""
+    return f"{_fg(_REASONING_GREY)}{line}{_RST}"
 
 
 def thought_rows(seconds: float | None, text: str, full: bool) -> list[str]:
@@ -263,6 +265,26 @@ def _fit(cli, frags: list, width: int) -> list:
     return [(rule_style(), cli._trim_status_bar_text(plain, width))]
 
 
+def _active_goal_text(cli) -> str:
+    """The goal's text, read off the dock's cached status line (``⊙ Goal (active, 3/20 turns): …``).
+    Asking the manager here would open state.db on every frame."""
+    line = str(getattr(getattr(cli, "_subagent_monitor", None), "goal", "") or "")
+    head, sep, text = line.partition("): ")
+    return text if sep and head.startswith(("⊙", "⏳")) else ""
+
+
+def _repeats_goal(title: str, goal_text: str) -> bool:
+    """True when the title restates the goal: one is a prefix of the other once whitespace and case
+    are ignored. Compared over the first 24 characters so a clipped title still matches; under 12
+    characters on either side is too short to call a repeat."""
+    title = " ".join(title.split()).casefold()
+    goal_text = " ".join(goal_text.split()).casefold()
+    if min(len(title), len(goal_text)) < 12:
+        return False
+    head = min(len(title), len(goal_text), 24)
+    return title[:head] == goal_text[:head]
+
+
 def top_rule_fragments(cli) -> list:
     """``── ⠹ Running tests · 14s ─────────── calc helpers ─``: live status left, session title right."""
     width = max(10, cli._get_tui_terminal_width())
@@ -278,6 +300,8 @@ def top_rule_fragments(cli) -> list:
                 left.append(("class:status-bar-dim bg:default", f" · {extra}"))
         left.append((rule, " "))
     title = cli._get_status_bar_session_title()
+    if title and _repeats_goal(title, _active_goal_text(cli)):
+        title = ""  # the goal is already on screen; the right half would print it twice
     right = [(rule, " "), (f"fg:{_skin_hex('ui_label', '#DAA520')}", title), (rule, " ─")] if title else []
     used = sum(cli._status_bar_display_width(text) for _, text in left + right)
     if used >= width:

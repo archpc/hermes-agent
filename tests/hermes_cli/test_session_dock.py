@@ -50,7 +50,9 @@ def test_dock_paints_goal_on_top_and_queue_last_and_follows_their_lifecycle(herm
     collapsed = dock.dock_text(columns=80, rows=40)
     counts = f"{t('cli.subagents.goal_active')} · {t('cli.subagents.count_queued', count=4)}"
     assert "\n" not in collapsed
-    assert f"{t('cli.subagents.heading_session_restore', count=counts)} · ⊙ Goal" in collapsed
+    # The heading already says "goal active": the collapsed row shows the next queued prompt instead.
+    assert f"{t('cli.subagents.heading_session_restore', count=counts)} · {t('cli.subagents.next_queued', text='first follow-up with a newline')}" in collapsed
+    assert "⊙ Goal" not in collapsed
     assert "Ctrl+T" not in collapsed  # the monitor only lists subagents/processes
     assert get_cwidth(collapsed) <= 80
 
@@ -156,3 +158,33 @@ def test_dock_repaints_a_goal_a_tool_changed_mid_turn(hermes_home):
     _HANDLERS["session.control.update"](agent, {"control": {}}, None, {})
     assert dock.refresh() and "1 subgoal" in dock.dock_text(columns=80, rows=40).splitlines()[0]
     assert cli._automation_stale is False
+
+
+def test_collapsed_row_shows_the_queued_prompt_over_the_goal(hermes_home, monkeypatch):
+    """With a turn queued the heading already says ``goal active``: repeating the goal text in the
+    activity slot wastes the row; the prompt that runs next is the useful news."""
+    from hermes_cli import cli_subagent_monitor
+    from hermes_cli.cli_subagent_monitor import SubagentMonitor
+    from hermes_cli.goals import GoalManager
+
+    # A process another test left in the registry would take the activity slot.
+    monkeypatch.setattr(cli_subagent_monitor.procs, "process_rows", lambda now: [])
+    mgr = GoalManager(session_id="sid-a")
+    mgr.set("ship the dock feature")
+    pending = queue.Queue()
+    cli = SimpleNamespace(agent=None, session_id="sid-a", _goal_manager=mgr, _pending_input=pending)
+    dock = SubagentMonitor(cli)
+    dock.collapsed = True
+
+    # Nothing queued: the goal's own text, without the ``⊙ Goal (active, n/m turns):`` label the
+    # heading and the status bar already carry.
+    assert dock.refresh()
+    alone = dock.dock_text(columns=100, rows=40)
+    assert "ship the dock feature" in alone and "⊙ Goal" not in alone and "goal active" in alone
+    pending.put("run the tests")
+    assert dock.refresh()
+    collapsed = dock.dock_text(columns=100, rows=40)
+    assert "run the tests" in collapsed and "ship the dock feature" not in collapsed
+
+    pending.queue.clear()
+    assert dock.refresh() and "ship the dock feature" in dock.dock_text(columns=100, rows=40)
