@@ -23,6 +23,23 @@ _RST, _BOLD, _DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
 _RED = "\x1b[38;2;239;83;80m"
 # Fixed mid-grey for reasoning: SGR dim renders too faint to read on some terminal themes.
 _REASONING_GREY = "#9A9A9A"
+_ESCAPE_SEQ = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|[@-_])"
+)
+_CTRL_ALL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _plain_output() -> bool:
+    return bool(os.environ.get("NO_COLOR")) or os.environ.get("TERM") == "dumb"
+
+
+def _defuse_terminal_text(text: str) -> str:
+    """Strip terminal escape sequences, C0/C1 controls, and bidi overrides from untrusted text."""
+    return _BIDI.sub("", _CTRL_ALL.sub(" ", _ESCAPE_SEQ.sub(" ", text or "")))
 
 
 def is_modern(cli) -> bool:
@@ -31,12 +48,14 @@ def is_modern(cli) -> bool:
 
 def layout_from_config(display: dict) -> bool:
     """True for the glyph layout (default); ``classic`` keeps the boxed transcript."""
-    return str((display or {}).get("cli_layout", "modern") or "modern").strip().lower() != "classic"
+    cfg = display if isinstance(display, dict) else {}
+    return str(cfg.get("cli_layout", "modern") or "modern").strip().lower() != "classic"
 
 
 def busy_input_mode_from_config(display: dict) -> str:
     """``display.busy_input_mode``; unset interrupts in both layouts (Tab still queues in this one)."""
-    return str((display or {}).get("busy_input_mode") or "interrupt").strip().lower()
+    cfg = display if isinstance(display, dict) else {}
+    return str(cfg.get("busy_input_mode") or "interrupt").strip().lower()
 
 
 def _skin_hex(key: str, fallback: str) -> str:
@@ -117,6 +136,8 @@ def thought_line(seconds: float | None) -> str:
     """``∴ Thought for 3s`` (grey italic), closing a reasoning block. No title: the reasoning is
     printed right above, so any excerpt of it would repeat what the user just read."""
     took = t("cli.modern.thought_for", seconds=f"{max(seconds or 0.0, 0.0):.0f}") if seconds else t("cli.modern.thought")
+    if _plain_output():
+        return f"∴ {took}"
     return f"{_fg(_REASONING_GREY)}\x1b[3m∴ {took}{_RST}"
 
 
@@ -124,8 +145,11 @@ _REASONING_PREVIEW_LINES = 10  # classic's post-hoc reasoning box shows this man
 
 
 def reasoning_text_line(line: str) -> str:
-    """One streamed reasoning line: grey, no frame (the grey bar above opens the block)."""
-    return f"{_fg(_REASONING_GREY)}{line}{_RST}"
+    """One streamed reasoning line: grey, no frame, with raw terminal escapes defused."""
+    safe = _defuse_terminal_text(line)
+    if _plain_output():
+        return safe
+    return f"{_fg(_REASONING_GREY)}{safe}{_RST}"
 
 
 def thought_rows(seconds: float | None, text: str, full: bool) -> list[str]:
@@ -274,15 +298,13 @@ def _active_goal_text(cli) -> str:
 
 
 def _repeats_goal(title: str, goal_text: str) -> bool:
-    """True when the title restates the goal: one is a prefix of the other once whitespace and case
-    are ignored. Compared over the first 24 characters so a clipped title still matches; under 12
-    characters on either side is too short to call a repeat."""
-    title = " ".join(title.split()).casefold()
-    goal_text = " ".join(goal_text.split()).casefold()
+    """True when the title restates the goal: once whitespace, case, and trailing clip ellipses are
+    normalized, one string is a prefix of the other (with at least 12 characters on each side)."""
+    title = " ".join(title.split()).rstrip(".… ").casefold()
+    goal_text = " ".join(goal_text.split()).rstrip(".… ").casefold()
     if min(len(title), len(goal_text)) < 12:
         return False
-    head = min(len(title), len(goal_text), 24)
-    return title[:head] == goal_text[:head]
+    return goal_text.startswith(title) or title.startswith(goal_text)
 
 
 def top_rule_fragments(cli) -> list:

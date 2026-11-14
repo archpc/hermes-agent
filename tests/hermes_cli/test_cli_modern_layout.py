@@ -307,3 +307,39 @@ def test_reasoning_rows_use_a_grey_foreground_not_sgr_dim():
     assert "\x1b[2m" not in line and "\x1b[2;3m" not in summary
     assert line.startswith(_fg(_REASONING_GREY)) and summary.startswith(_fg(_REASONING_GREY))
     assert "\x1b[3m" in summary
+
+
+def test_top_rule_keeps_distinct_title_sharing_opening_words_with_goal():
+    """A manual /title that diverges after a shared 24-char prefix is distinct metadata, not a
+    clipped auto-title; clipped auto-titles ending with ellipsis still collapse."""
+    from hermes_cli.cli_modern_layout import top_rule_fragments
+
+    goal = "⊙ Goal (active, 3/20 turns): Audit hermes-tmux-workspace performance and watchers"
+    plain = lambda cli: "".join(text for _, text in top_rule_fragments(cli))
+    # Clipped auto-title with ellipsis still collapses
+    assert "Audit hermes-tmux-workspace…" not in plain(
+        _rule_cli("Audit hermes-tmux-workspace…", goal, width=140))
+    # Distinct manual /title sharing the first 28 chars must stay visible
+    assert "Audit hermes-tmux-workspace Phase 2" in plain(
+        _rule_cli("Audit hermes-tmux-workspace Phase 2", goal, width=140))
+
+
+def test_reasoning_text_line_defuses_hostile_escapes_and_honors_no_color(monkeypatch):
+    from hermes_cli.cli_modern_layout import reasoning_text_line, thought_line
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    hostile = reasoning_text_line("step \x1b]52;c;SGVsbG8=\x07 \x1b[2J \u202eevil")
+    assert "\x1b]52;" not in hostile
+    assert "\x1b[2J" not in hostile
+    assert "\u202e" not in hostile
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert reasoning_text_line("plain thought") == "plain thought"
+    assert "\x1b[" not in thought_line(3.0)
+
+
+def test_config_readers_tolerate_non_dict_display_value():
+    from hermes_cli.cli_modern_layout import busy_input_mode_from_config, layout_from_config
+
+    assert layout_from_config("compact") is True
+    assert busy_input_mode_from_config("compact") == "interrupt"
