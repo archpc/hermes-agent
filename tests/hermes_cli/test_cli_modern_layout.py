@@ -336,6 +336,8 @@ def test_reasoning_text_line_defuses_hostile_escapes_and_honors_no_color(monkeyp
     monkeypatch.setenv("NO_COLOR", "1")
     assert reasoning_text_line("plain thought") == "plain thought"
     assert "\x1b[" not in thought_line(3.0)
+    from hermes_cli.cli_modern_layout import thought_rows
+    assert "\x1b[" not in "\n".join(thought_rows(3.0, "\n".join(f"line {i}" for i in range(15)), full=False))
 
 
 def test_config_readers_tolerate_non_dict_display_value():

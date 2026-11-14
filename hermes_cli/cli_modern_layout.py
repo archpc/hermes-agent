@@ -64,6 +64,8 @@ def _skin_hex(key: str, fallback: str) -> str:
 
 
 def _fg(hex_color: str, bold: bool = False) -> str:
+    if _plain_output():
+        return ""
     try:
         r, g, b = (int(hex_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
         return f"\x1b[{'1;' if bold else ''}38;2;{r};{g};{b}m"
@@ -101,6 +103,8 @@ def separator(accent: bool) -> str:
     a blank line ahead of it, so it also settles a gap the previous block owes."""
     global _GAP_PENDING
     _GAP_PENDING = False
+    if _plain_output():
+        return "─" * _SEPARATOR_WIDTH
     color = _fg(_skin_hex("ui_accent", "#FFBF00")) if accent else _DIM
     return f"{color}{'─' * _SEPARATOR_WIDTH}{_RST}"
 
@@ -159,7 +163,8 @@ def thought_rows(seconds: float | None, text: str, full: bool) -> list[str]:
     shown = lines if full or len(lines) <= _REASONING_PREVIEW_LINES else lines[:_REASONING_PREVIEW_LINES]
     rows = ["", separator(False), *(reasoning_text_line(line) for line in shown)]
     if len(shown) < len(lines):
-        rows.append(f"{_DIM}  {t('cli.chat.reasoning_more_lines', count=len(lines) - len(shown))}{_RST}")
+        more = f"  {t('cli.chat.reasoning_more_lines', count=len(lines) - len(shown))}"
+        rows.append(more if _plain_output() else f"{_DIM}{more}{_RST}")
     return [*rows, thought_line(seconds), closing_separator(False)]
 
 
