@@ -21,6 +21,25 @@ logger = logging.getLogger(__name__)
 _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 _RST, _BOLD, _DIM = "\x1b[0m", "\x1b[1m", "\x1b[2m"
 _RED = "\x1b[38;2;239;83;80m"
+# Fixed mid-grey for reasoning: SGR dim renders too faint to read on some terminal themes.
+_REASONING_GREY = "#9A9A9A"
+_ESCAPE_SEQ = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]"
+    r"|\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+    r"|[PX^_][^\x1b]*(?:\x1b\\)?"
+    r"|[@-_])"
+)
+_CTRL_ALL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _plain_output() -> bool:
+    return bool(os.environ.get("NO_COLOR")) or os.environ.get("TERM") == "dumb"
+
+
+def _defuse_terminal_text(text: str) -> str:
+    """Strip terminal escape sequences, C0/C1 controls, and bidi overrides from untrusted text."""
+    return _BIDI.sub("", _CTRL_ALL.sub(" ", _ESCAPE_SEQ.sub(" ", text or "")))
 
 
 def is_modern(cli) -> bool:
@@ -29,12 +48,14 @@ def is_modern(cli) -> bool:
 
 def layout_from_config(display: dict) -> bool:
     """True for the glyph layout (default); ``classic`` keeps the boxed transcript."""
-    return str((display or {}).get("cli_layout", "modern") or "modern").strip().lower() != "classic"
+    cfg = display if isinstance(display, dict) else {}
+    return str(cfg.get("cli_layout", "modern") or "modern").strip().lower() != "classic"
 
 
 def busy_input_mode_from_config(display: dict) -> str:
     """``display.busy_input_mode``; unset interrupts in both layouts (Tab still queues in this one)."""
-    return str((display or {}).get("busy_input_mode") or "interrupt").strip().lower()
+    cfg = display if isinstance(display, dict) else {}
+    return str(cfg.get("busy_input_mode") or "interrupt").strip().lower()
 
 
 def _skin_hex(key: str, fallback: str) -> str:
@@ -43,6 +64,8 @@ def _skin_hex(key: str, fallback: str) -> str:
 
 
 def _fg(hex_color: str, bold: bool = False) -> str:
+    if _plain_output():
+        return ""
     try:
         r, g, b = (int(hex_color.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4))
         return f"\x1b[{'1;' if bold else ''}38;2;{r};{g};{b}m"
@@ -80,6 +103,8 @@ def separator(accent: bool) -> str:
     a blank line ahead of it, so it also settles a gap the previous block owes."""
     global _GAP_PENDING
     _GAP_PENDING = False
+    if _plain_output():
+        return "─" * _SEPARATOR_WIDTH
     color = _fg(_skin_hex("ui_accent", "#FFBF00")) if accent else _DIM
     return f"{color}{'─' * _SEPARATOR_WIDTH}{_RST}"
 
@@ -112,18 +137,23 @@ def answer_label(timestamp: str = "") -> str:
 
 
 def thought_line(seconds: float | None) -> str:
-    """``∴ Thought for 3s`` (dim italic), closing a reasoning block. No title: the reasoning is
+    """``∴ Thought for 3s`` (grey italic), closing a reasoning block. No title: the reasoning is
     printed right above, so any excerpt of it would repeat what the user just read."""
     took = t("cli.modern.thought_for", seconds=f"{max(seconds or 0.0, 0.0):.0f}") if seconds else t("cli.modern.thought")
-    return f"\x1b[2;3m∴ {took}{_RST}"
+    if _plain_output():
+        return f"∴ {took}"
+    return f"{_fg(_REASONING_GREY)}\x1b[3m∴ {took}{_RST}"
 
 
 _REASONING_PREVIEW_LINES = 10  # classic's post-hoc reasoning box shows this many unless /reasoning full
 
 
 def reasoning_text_line(line: str) -> str:
-    """One streamed reasoning line: dim, no frame (the dim bar above opens the block)."""
-    return f"{_DIM}{line}{_RST}"
+    """One streamed reasoning line: grey, no frame, with raw terminal escapes defused."""
+    safe = _defuse_terminal_text(line)
+    if _plain_output():
+        return safe
+    return f"{_fg(_REASONING_GREY)}{safe}{_RST}"
 
 
 def thought_rows(seconds: float | None, text: str, full: bool) -> list[str]:
@@ -133,7 +163,8 @@ def thought_rows(seconds: float | None, text: str, full: bool) -> list[str]:
     shown = lines if full or len(lines) <= _REASONING_PREVIEW_LINES else lines[:_REASONING_PREVIEW_LINES]
     rows = ["", separator(False), *(reasoning_text_line(line) for line in shown)]
     if len(shown) < len(lines):
-        rows.append(f"{_DIM}  {t('cli.chat.reasoning_more_lines', count=len(lines) - len(shown))}{_RST}")
+        more = f"  {t('cli.chat.reasoning_more_lines', count=len(lines) - len(shown))}"
+        rows.append(more if _plain_output() else f"{_DIM}{more}{_RST}")
     return [*rows, thought_line(seconds), closing_separator(False)]
 
 
@@ -263,6 +294,24 @@ def _fit(cli, frags: list, width: int) -> list:
     return [(rule_style(), cli._trim_status_bar_text(plain, width))]
 
 
+def _active_goal_text(cli) -> str:
+    """The goal's text, read off the dock's cached status line (``⊙ Goal (active, 3/20 turns): …``).
+    Asking the manager here would open state.db on every frame."""
+    line = str(getattr(getattr(cli, "_subagent_monitor", None), "goal", "") or "")
+    head, sep, text = line.partition("): ")
+    return text if sep and head.startswith(("⊙", "⏳")) else ""
+
+
+def _repeats_goal(title: str, goal_text: str) -> bool:
+    """True when the title restates the goal: once whitespace, case, and trailing clip ellipses are
+    normalized, one string is a prefix of the other (with at least 12 characters on each side)."""
+    title = " ".join(title.split()).rstrip(".… ").casefold()
+    goal_text = " ".join(goal_text.split()).rstrip(".… ").casefold()
+    if min(len(title), len(goal_text)) < 12:
+        return False
+    return goal_text.startswith(title) or title.startswith(goal_text)
+
+
 def top_rule_fragments(cli) -> list:
     """``── ⠹ Running tests · 14s ─────────── calc helpers ─``: live status left, session title right."""
     width = max(10, cli._get_tui_terminal_width())
@@ -278,6 +327,8 @@ def top_rule_fragments(cli) -> list:
                 left.append(("class:status-bar-dim bg:default", f" · {extra}"))
         left.append((rule, " "))
     title = cli._get_status_bar_session_title()
+    if title and _repeats_goal(title, _active_goal_text(cli)):
+        title = ""  # the goal is already on screen; the right half would print it twice
     right = [(rule, " "), (f"fg:{_skin_hex('ui_label', '#DAA520')}", title), (rule, " ─")] if title else []
     used = sum(cli._status_bar_display_width(text) for _, text in left + right)
     if used >= width:

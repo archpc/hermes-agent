@@ -16,6 +16,11 @@ from hermes_cli import cli_session_dock as session_rows
 logger = logging.getLogger(__name__)
 
 
+def dock_mode_from_config(display: dict | None) -> str:
+    """``display.dock``: ``compact`` starts the dock collapsed (Ctrl+R still expands); else full."""
+    return str((display if isinstance(display, dict) else {}).get("dock") or "full").strip().lower()
+
+
 def _clip(value, width):
     text = ' '.join(str(value or '').split())
     text = ''.join(c for c in text if c.isprintable())
@@ -202,8 +207,13 @@ class SubagentMonitor:
             return self._agent_activity(self.entries[0])
         if self.processes:
             return procs.process_activity(self.processes[0])
-        # The loop's state is already the heading's badge; its prompt is the activity.
-        return self.goal or self.loop_prompt or t('cli.subagents.next_queued', text=self.queued[0])
+        # The heading already names the goal, so a queued prompt is the news; the loop's state is
+        # its badge, its prompt the activity.
+        if self.queued:
+            return t('cli.subagents.next_queued', text=self.queued[0])
+        # ``⊙ Goal (active, 3/20 turns): text`` minus its label: the heading says "goal active" and
+        # the status bar carries the turn count, so the row's room goes to the goal itself.
+        return self.goal.partition('): ')[2] or self.goal or self.loop_prompt
 
     def dock_text(self, *, columns, rows):
         if not self.has_rows:
@@ -523,6 +533,7 @@ def install_dock(cli):
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.filters import Condition
     monitor = SubagentMonitor(cli)
+    monitor.collapsed = dock_mode_from_config((getattr(cli, "config", None) or {}).get("display")) == "compact"
     cli._subagent_monitor = monitor
     monitor.refresh()
 

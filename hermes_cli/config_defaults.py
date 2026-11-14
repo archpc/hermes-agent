@@ -822,6 +822,9 @@ DEFAULT_CONFIG = {
         # `hermes`/`hermes chat` launches "cli" (prompt_toolkit REPL) | "tui" (Ink); --cli, --tui, HERMES_TUI=1 win.
         # cli_layout = the REPL's look: "modern" (glyph rows, status under the composer) | "classic" (boxed panels).
         "interface": "cli", "cli_layout": "modern",
+        # Classic CLI live-work dock above the input: "full" (goal/subagent/queue rows) | "compact"
+        # (starts collapsed to one row; Ctrl+R expands).
+        "dock": "full",
         # Native TUI uses the terminal's primary buffer and scrollback instead of the custom
         # alternate-screen viewport. Flags win: `--native` / `--tui-native` and `--cli`.
         "tui_native": False,

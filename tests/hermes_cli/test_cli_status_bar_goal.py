@@ -38,7 +38,7 @@ class TestStatusBarGoalSegment:
         assert snapshot["goal_active"] is True
         assert snapshot["goal_turns_used"] == 3
         assert snapshot["goal_max_turns"] == 20
-        assert cli_obj._status_bar_goal_segment(snapshot) == "⊙ goal 3/20"
+        assert cli_obj._status_bar_goal_segment(snapshot) == "⊙ goal · turn 3/20"
 
     def test_goal_segment_absent_when_paused(self):
         # Paused goals must NOT occupy the status bar (active-only contract).
@@ -54,4 +54,4 @@ class TestStatusBarGoalSegment:
 
         text = cli_obj._build_status_bar_text(width=120)
 
-        assert "⊙ goal 5/20" in text
+        assert "⊙ goal · turn 5/20" in text

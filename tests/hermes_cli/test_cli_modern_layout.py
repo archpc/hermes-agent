@@ -261,3 +261,87 @@ def test_every_block_is_framed_by_bars_and_blank_lines(monkeypatch):
                    "", "📖", "💻",                  # tool rows, tight
                    "", "BAR", "☤", "It", "BAR",    # answer
                    "", "─"], got                   # footer
+
+
+def _rule_cli(title: str, goal_line: str, width: int = 100):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        _agent_running=False, _command_running=False,
+        _get_tui_terminal_width=lambda: width,
+        _status_bar_display_width=lambda text: len(text),
+        _trim_status_bar_text=lambda text, room: text[:room],
+        _get_status_bar_session_title=lambda: title,
+        _subagent_monitor=SimpleNamespace(goal=goal_line))
+
+
+def test_top_rule_omits_a_title_that_restates_the_active_goal():
+    """The rule's right half is the session title; when /goal made it the goal text (case or
+    whitespace aside, or a clipped form of it) the rule prints the goal a second time."""
+    from hermes_cli.cli_modern_layout import top_rule_fragments
+
+    goal = "⊙ Goal (active, 3/20 turns): ship the compact dock footer"
+    plain = lambda cli: "".join(text for _, text in top_rule_fragments(cli))
+    assert "Ship the compact dock footer" not in plain(_rule_cli("Ship the compact dock footer", goal))
+    # A longer title whose opening is the goal is the same repeat.
+    assert "ship the compact dock footer now" not in plain(
+        _rule_cli("ship the compact dock footer now", goal))
+    # Control: a different title, a short title, and no goal all still show the title.
+    assert "other work" in plain(_rule_cli("other work", goal))
+    assert "fix tests" in plain(_rule_cli("fix tests", goal))
+    assert "Ship the dock" in plain(_rule_cli("Ship the dock", ""))
+
+    # Reading the goal never touches the manager (that would open state.db every frame).
+    from types import SimpleNamespace
+    cli = _rule_cli("Ship the compact dock footer", goal)
+    cli._get_goal_manager = lambda: 1 / 0
+    assert "Ship the compact dock footer" not in plain(cli)
+
+
+def test_reasoning_rows_use_a_grey_foreground_not_sgr_dim():
+    """SGR dim disappears on light themes and in tmux status reconstructions: reasoning gets a
+    fixed mid-grey, and the closing summary stays italic."""
+    from hermes_cli.cli_modern_layout import _REASONING_GREY, _fg, reasoning_text_line, thought_line
+
+    line, summary = reasoning_text_line("plan the change"), thought_line(2.0)
+    assert "\x1b[2m" not in line and "\x1b[2;3m" not in summary
+    assert line.startswith(_fg(_REASONING_GREY)) and summary.startswith(_fg(_REASONING_GREY))
+    assert "\x1b[3m" in summary
+
+
+def test_top_rule_keeps_distinct_title_sharing_opening_words_with_goal():
+    """A manual /title that diverges after a shared 24-char prefix is distinct metadata, not a
+    clipped auto-title; clipped auto-titles ending with ellipsis still collapse."""
+    from hermes_cli.cli_modern_layout import top_rule_fragments
+
+    goal = "⊙ Goal (active, 3/20 turns): Audit hermes-tmux-workspace performance and watchers"
+    plain = lambda cli: "".join(text for _, text in top_rule_fragments(cli))
+    # Clipped auto-title with ellipsis still collapses
+    assert "Audit hermes-tmux-workspace…" not in plain(
+        _rule_cli("Audit hermes-tmux-workspace…", goal, width=140))
+    # Distinct manual /title sharing the first 28 chars must stay visible
+    assert "Audit hermes-tmux-workspace Phase 2" in plain(
+        _rule_cli("Audit hermes-tmux-workspace Phase 2", goal, width=140))
+
+
+def test_reasoning_text_line_defuses_hostile_escapes_and_honors_no_color(monkeypatch):
+    from hermes_cli.cli_modern_layout import reasoning_text_line, thought_line
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    hostile = reasoning_text_line("step \x1b]52;c;SGVsbG8=\x07 \x1b[2J \u202eevil")
+    assert "\x1b]52;" not in hostile
+    assert "\x1b[2J" not in hostile
+    assert "\u202e" not in hostile
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert reasoning_text_line("plain thought") == "plain thought"
+    assert "\x1b[" not in thought_line(3.0)
+    from hermes_cli.cli_modern_layout import thought_rows
+    assert "\x1b[" not in "\n".join(thought_rows(3.0, "\n".join(f"line {i}" for i in range(15)), full=False))
+
+
+def test_config_readers_tolerate_non_dict_display_value():
+    from hermes_cli.cli_modern_layout import busy_input_mode_from_config, layout_from_config
+
+    assert layout_from_config("compact") is True
+    assert busy_input_mode_from_config("compact") == "interrupt"

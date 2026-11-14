@@ -92,3 +92,22 @@ def test_collapsed_summary_prioritizes_live_count_and_controls_at_small_widths()
             assert t('cli.subagents.last_tool', tool='terminal') in text
     monitor.entries.clear()
     assert monitor.dock_text(columns=80, rows=20) == ''
+
+
+def test_display_dock_compact_starts_collapsed_and_ctrl_r_still_expands():
+    """``display.dock: compact`` is the only reason the dock starts collapsed; anything else keeps
+    the full dock, and the Ctrl+R toggle works either way."""
+    from hermes_cli.cli_subagent_monitor import install_dock, toggle_dock
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["display"]["dock"] == "full"
+    cli = SimpleNamespace(agent=None, config={"display": {"dock": "compact"}}, _invalidate=lambda: None)
+    install_dock(cli)
+    assert cli._subagent_monitor.collapsed
+    toggle_dock(cli)
+    assert not cli._subagent_monitor.collapsed
+
+    for display in ({}, {"dock": "full"}, {"dock": "sideways"}):
+        cli = SimpleNamespace(agent=None, config={"display": display}, _invalidate=lambda: None)
+        install_dock(cli)
+        assert not cli._subagent_monitor.collapsed, display
