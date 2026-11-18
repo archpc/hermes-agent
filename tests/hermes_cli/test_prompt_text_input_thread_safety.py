@@ -2,11 +2,17 @@
 
 Raw ``input()`` prompts can race with prompt_toolkit when called from the TUI.
 The normal slash confirmations now use a prompt_toolkit-native modal, but
-``_prompt_text_input`` remains as a fallback for non-interactive calls and edge
-cases.
+``_prompt_text_input`` remains the free-text path (billing amounts) and as a
+fallback for non-interactive calls. From the ``process_loop`` worker it must
+route through the app loop rather than cancelling — the #23185 guard used to
+return ``None``, so ``/topup`` → Auto-reload printed "Cancelled." without ever
+showing a field.
 """
 
+import asyncio
 import threading
+from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -17,19 +23,34 @@ def _make_cli():
     obj = object.__new__(cli_mod.HermesCLI)
     obj._app = MagicMock()
     obj._status_bar_visible = True
+    obj._invalidate = lambda *a, **k: None
     return obj
+
+
+def _start_loop():
+    """Run an asyncio loop on a background thread (stand-in for the prompt_toolkit app loop)."""
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def _run():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(ready.set)
+        loop.run_forever()
+
+    threading.Thread(target=_run, name="fake-app-loop", daemon=True).start()
+    assert ready.wait(5), "fake app loop did not start"
+    return loop
 
 
 class TestPromptTextInputThreadSafety:
 
     def test_background_thread_cancels_instead_of_hanging(self):
-        """On a daemon thread with an active app, cancel cleanly (return None).
+        """With an app but no usable event loop, cancel cleanly (return None).
 
         stdin is owned by the prompt_toolkit event loop / JSON-RPC pipe on the
         non-main (process_loop / slash-worker) thread, so a bare input() there
         would block until the worker's timeout (#23185 / billing auto-reload
-        hang). The guard cancels to None instead of hanging — it must NOT call
-        run_in_terminal (orphaned coroutine) and must NOT call input().
+        hang). No live loop to schedule onto → cancel; never call input().
         """
         cli = _make_cli()
 
@@ -85,3 +106,49 @@ class TestPromptTextInputThreadSafety:
             result = cli._prompt_text_input("Choice: ")
 
         assert result is None
+
+
+class TestPromptViaAppLoop:
+    """A worker thread must get real input, not an instant ``None`` (#23185 follow-up)."""
+
+    def test_background_thread_prompts_through_the_app_loop(self):
+        cli = _make_cli()
+        cli._app.loop = _start_loop()
+        ran_on = {}
+        seen = {}
+
+        async def fake_run_in_terminal(func):
+            ran_on["thread"] = threading.current_thread().name
+            return func()
+
+        def worker():
+            with patch("prompt_toolkit.application.run_in_terminal", fake_run_in_terminal), \
+                 patch("builtins.input", return_value=" 25 ") as mock_input:
+                seen["value"] = cli._prompt_text_input("When balance falls below (USD): ")
+                seen["input_called"] = mock_input.called
+
+        t = threading.Thread(target=worker, name="process_loop", daemon=True)
+        t.start()
+        t.join(timeout=10)
+
+        assert not t.is_alive(), "worker blocked forever on the prompt"
+        assert seen["input_called"] is True
+        assert seen["value"] == "25"
+        assert ran_on.get("thread") == "fake-app-loop", "prompt did not run on the app loop"
+
+    def test_empty_answer_returns_none_not_a_cancel_sentinel(self):
+        cli = _make_cli()
+        cli._app.loop = _start_loop()
+
+        async def fake_run_in_terminal(func):
+            return func()
+
+        def worker():
+            with patch("prompt_toolkit.application.run_in_terminal", fake_run_in_terminal), \
+                 patch("builtins.input", return_value="   "):
+                assert cli._prompt_text_input("Threshold: ") is None
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(timeout=10)
+        assert not t.is_alive()

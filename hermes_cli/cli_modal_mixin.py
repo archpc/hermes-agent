@@ -7,6 +7,8 @@ imported LAZILY inside each method — the mixin never imports ``cli`` at module
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import queue
 import sys
@@ -19,6 +21,7 @@ from hermes_cli.callbacks import prompt_for_secret
 from typing import Optional
 
 _TIMED_OUT = object()  # sentinel returned by _poll_modal_queue when the deadline passes
+_NO_APP_LOOP = object()  # sentinel: no live prompt_toolkit loop to route a prompt through
 
 # Typed answers accepted by the slash-confirm modal, mapped onto the canonical choice values.
 _CONFIRM_ALIASES = {
@@ -227,15 +230,19 @@ class CLIModalMixin:
     def _prompt_text_input(self, prompt_text: str) -> str | None:
         """Prompt for free-text input safely inside or outside prompt_toolkit.
 
-        ``run_in_terminal`` only works on the main-thread loop; on the ``process_loop`` daemon
-        thread a bare ``input()`` would block forever on loop-owned stdin, so with an app running
-        off-main we cancel cleanly (None) — mirroring ``_stdin_fallback`` in the modal prompt.
+        Three cases:
 
-        Mirrors the thread-aware guard in ``_run_curses_picker``: ``run_in_terminal`` returns a coroutine
-        that must be awaited by the prompt_toolkit event loop, which only exists on the main thread. Slash
-        commands are dispatched from the ``process_loop`` daemon thread (see issue #23185), so calling
-        ``run_in_terminal`` from there orphans the coroutine — ``_ask`` never runs, and user keystrokes leak
-        into the composer instead. Fall back to a direct ``input()`` when we're off the main thread.
+        * No prompt_toolkit app → plain ``input()``.
+        * App running, called from another thread (the ``process_loop`` / slash worker) → schedule the
+          prompt onto the app's event loop through ``run_in_terminal`` and block this thread until the
+          answer arrives (``_prompt_text_input_via_app_loop``). Blocking here is safe: the loop owns
+          stdin on the main thread, so the prompt still paints and reads real keystrokes.
+        * App running on the calling (main) thread → schedule it and return; blocking the loop would
+          deadlock the prompt itself.
+
+        Returning ``None`` whenever we were off the main thread (the #23185 guard) silently cancelled
+        every free-text step of the billing wizard — e.g. ``/topup`` → Auto-reload printed
+        "🟡 Cancelled." before the threshold field was ever shown.
         """
         result = [None]
 
@@ -246,12 +253,13 @@ class CLIModalMixin:
                 pass
 
         in_main_thread = threading.current_thread() is threading.main_thread()
-        # Slash-worker guard (#23185 / billing auto-reload hang): when a prompt_toolkit app is running but
-        # we're on a non-main thread (the process_loop / TUI slash-worker daemon thread), stdin is owned by
-        # the event loop / JSON-RPC pipe. A bare input() there blocks forever until the worker's 45s timeout
-        # fires. We cannot safely prompt off the main thread, so cancel cleanly (None) instead of hanging —
-        # mirrors the _stdin_fallback discipline in _prompt_text_input_modal.
+        # Slash-worker guard (#23185): when a prompt_toolkit app is running but we're on a non-main
+        # thread, a bare input() would block forever on loop-owned stdin. Route the prompt through
+        # the app loop instead of hanging — and instead of cancelling the user's flow.
         if self._app and not in_main_thread:
+            value = self._prompt_text_input_via_app_loop(prompt_text)
+            if value is not _NO_APP_LOOP:
+                return value if isinstance(value, str) else None
             self._invalidate()
             return None
 
@@ -275,6 +283,56 @@ class CLIModalMixin:
         else:
             _ask()
         return result[0]
+
+    def _prompt_text_input_via_app_loop(
+        self, prompt_text: str, *, timeout: float = 300.0
+    ):
+        """Read free text above a running prompt_toolkit app from a WORKER thread.
+
+        Returns the stripped answer (``None`` for empty / aborted input) or ``_NO_APP_LOOP`` when
+        there is no live app loop to schedule onto, so the caller can keep its old fallback.
+
+        ``run_in_terminal`` hands the terminal back to normal cooked mode while it runs, so the
+        blocking ``input()`` is legal there — but the coroutine it schedules must be created *on*
+        the app loop, hence ``run_coroutine_threadsafe`` rather than calling it from this thread.
+        The wait is bounded: a prompt nobody answers degrades to a cancel, never a stuck REPL.
+        """
+        app = getattr(self, "_app", None)
+        loop = getattr(app, "loop", None)
+        if not isinstance(loop, asyncio.AbstractEventLoop) or not loop.is_running():
+            return _NO_APP_LOOP
+
+        from prompt_toolkit.application import run_in_terminal
+        from cli import logger
+
+        def _ask():
+            try:
+                return input(prompt_text).strip() or None
+            except (KeyboardInterrupt, EOFError):
+                return None
+
+        async def _ask_above_tui():
+            return await run_in_terminal(_ask)
+
+        was_visible = self._status_bar_visible
+        self._status_bar_visible = False
+        self._invalidate()
+        try:
+            future = asyncio.run_coroutine_threadsafe(_ask_above_tui(), loop)
+        except Exception as exc:  # loop closed mid-teardown
+            logger.debug("prompt: could not schedule on the app loop: %s", exc)
+            return _NO_APP_LOOP
+        try:
+            return future.result(timeout=timeout)
+        except (TimeoutError, concurrent.futures.TimeoutError):
+            future.cancel()
+            return None
+        except Exception as exc:
+            logger.debug("prompt: app-loop prompt failed: %s", exc)
+            return None
+        finally:
+            self._status_bar_visible = was_visible
+            self._invalidate()
 
     def _poll_modal_queue(self, response_queue, deadline_attr, *, refresh=1.0, paint=None):
         """Block until a value lands on ``response_queue`` or ``self.<deadline_attr>`` passes
