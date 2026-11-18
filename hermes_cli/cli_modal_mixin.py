@@ -22,6 +22,27 @@ from typing import Optional
 
 _TIMED_OUT = object()  # sentinel returned by _poll_modal_queue when the deadline passes
 _NO_APP_LOOP = object()  # sentinel: no live prompt_toolkit loop to route a prompt through
+# Ctrl+C as delivered inside tmux with ``set -g extended-keys on`` (modifyOtherKeys xterm format).
+# prompt_toolkit decodes it via our input aliases; a bare input() sees the raw bytes.
+_ENCODED_CTRL_C = "\x1b[27;5;99~"
+
+
+def _read_prompt_line(prompt_text: str) -> str | None:
+    """One free-text answer from the released terminal; ``None`` when empty or cancelled.
+
+    Both prompt paths (main-thread ``run_in_terminal`` and the worker-thread app-loop hop) call
+    this so a cancel means the same thing everywhere. The raw ``input()`` cannot decode
+    modifyOtherKeys, so under tmux ``extended-keys`` Ctrl+C arrives as ``_ENCODED_CTRL_C`` instead
+    of SIGINT: treat that as a cancel, else the escape bytes land in the answer and the billing
+    amount is rejected as malformed.
+    """
+    try:
+        raw = input(prompt_text)
+    except (KeyboardInterrupt, EOFError):
+        return None
+    if _ENCODED_CTRL_C in raw:
+        return None
+    return raw.strip() or None
 
 # Typed answers accepted by the slash-confirm modal, mapped onto the canonical choice values.
 _CONFIRM_ALIASES = {
@@ -244,13 +265,10 @@ class CLIModalMixin:
         every free-text step of the billing wizard — e.g. ``/topup`` → Auto-reload printed
         "🟡 Cancelled." before the threshold field was ever shown.
         """
-        result = [None]
+        result: list[str | None] = [None]
 
         def _ask():
-            try:
-                result[0] = input(prompt_text).strip() or None
-            except (KeyboardInterrupt, EOFError):
-                pass
+            result[0] = _read_prompt_line(prompt_text)
 
         in_main_thread = threading.current_thread() is threading.main_thread()
         # Slash-worker guard (#23185): when a prompt_toolkit app is running but we're on a non-main
@@ -306,10 +324,7 @@ class CLIModalMixin:
         from cli import logger
 
         def _ask():
-            try:
-                return input(prompt_text).strip() or None
-            except (KeyboardInterrupt, EOFError):
-                return None
+            return _read_prompt_line(prompt_text)
 
         async def _ask_above_tui():
             return await run_in_terminal(_ask)
