@@ -1,8 +1,9 @@
-"""Verification-only scenario coverage for the free-text prompt fix (c01e455b645).
+"""Scenario coverage for the free-text prompt paths (c01e455b645 + the Ctrl+C cancel fix).
 
-Not part of the shipped change: this file is untracked in a throwaway clone and is run by
-TestBench alongside the committed regression tests to exercise cancellation, timeout,
-application shutdown, thread leaks, and terminal-state restoration.
+Exercises cancellation, timeout, application shutdown, thread leaks, and terminal-state
+restoration around ``_prompt_text_input``. Run it from a checkout outside the Hermes home —
+``tests/home_io_guard.py`` refuses the ``manifest.json`` read when the repo lives inside
+``~/.hermes``, which is why CI-style ``pytest`` from a default install errors out here.
 
 Never touches billing: the auto-top-up PATCH is always mocked.
 """
@@ -49,7 +50,7 @@ def _run_in_thread(fn, timeout=10.0):
     def _wrap():
         try:
             box["result"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - surfaced to the assertion
+        except BaseException as exc:
             box["exc"] = exc
 
     t = threading.Thread(target=_wrap, name="scenario-worker", daemon=True)
@@ -144,7 +145,7 @@ def test_app_shutdown_mid_prompt_does_not_crash_the_worker():
         try:
             with patch("prompt_toolkit.application.run_in_terminal", _pending):
                 box["value"] = cli._prompt_text_input_via_app_loop("Threshold: ", timeout=5)
-        except BaseException as exc:  # noqa: BLE001
+        except BaseException as exc:
             box["exc"] = exc
 
     t = threading.Thread(target=_worker, name="scenario-shutdown", daemon=True)
