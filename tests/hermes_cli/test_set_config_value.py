@@ -142,6 +142,18 @@ class TestConfigYamlRouting:
         config = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert config["tools"]["tool_search"]["defer"] == ["todo_list", "skill_manage"]
 
+    def test_delegation_worktree_isolation_is_recognized(self, _isolated_hermes_home, capsys):
+        """The documented subagent worktree isolation flag is runtime config
+        (tools/delegate_tool_config._get_worktree_isolation), so it must validate
+        as a known key instead of warning falsely (#103149)."""
+        set_config_value("delegation.worktree_isolation", "true")
+
+        captured = capsys.readouterr()
+        assert "not a recognized config key" not in captured.out
+        assert "not a recognized config key" not in captured.err
+        config = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert config["delegation"]["worktree_isolation"] is True
+
 
     def test_terminal_docker_shared_key_preserves_string_values(
         self, _isolated_hermes_home, capsys

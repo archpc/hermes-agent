@@ -1341,6 +1341,10 @@ DEFAULT_CONFIG = {
         # the PARENT; false suppresses them (the child's result is the deliverable). Async-delegation results are NEVER
         # suppressed. auto_resume: opt-in (spends tokens unattended), gives up with one failure after the deadline.
         "surface_child_process_notifications": False,
+        # Each child gets its own git worktree off the parent's HEAD so parallel children
+        # never contend for one working copy (local backend + git repos only; otherwise
+        # silently ignored). See tools/subagent_worktree.py.
+        "worktree_isolation": False,
         "resumable_ttl_hours": 48, "max_resumable": 32, "auto_resume": False, "auto_resume_deadline_minutes": 360,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
