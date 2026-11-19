@@ -3686,17 +3686,37 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
-    if not steer_text:
-        return
     # Skip non-tool messages in the tail in case something else is appended at the boundary.
     tail = range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1)
     target = next((messages[j] for j in tail if isinstance(messages[j], dict) and messages[j].get("role") == "tool"), None)
+    steer_text = agent._drain_pending_steer()
     if target is None:
         # No tool result in this batch (e.g. all skipped by interrupt);
         # requeue so the fallback path delivers it as a normal next-turn
         # user message (which persists like any other user turn).
-        _requeue_pending_steer(agent, steer_text)
+        if steer_text:
+            _requeue_pending_steer(agent, steer_text)
+        return
+    # G1 mid-turn checkpoint: renew owned claims and take delivery of cross-session
+    # inbox messages. Coordination text is delivered as a DISTINCT UNTRUSTED row
+    # (coordination_user_row), never the user-authority steer marker. Only one user
+    # row may follow a tool batch, so when both are pending the steer is requeued to
+    # the next batch (fail-open; CAS drain guarantees exactly-once take).
+    coord_block = None
+    try:
+        from agent.coordination_inbox import drain_into_note, heartbeat_claims
+        heartbeat_claims(agent)
+        coord_block = drain_into_note(agent)
+    except Exception:
+        pass
+    if coord_block:
+        from agent.coordination_inbox import coordination_user_row
+        messages.append(coordination_user_row(coord_block))
+        if steer_text:
+            _requeue_pending_steer(agent, steer_text)
+        _ra().logger.info("Delivered coordination inbox (%d chars) as untrusted peer note", len(coord_block))
+        return
+    if not steer_text:
         return
     messages.append(steer_user_row(steer_text))
     _ra().logger.info(

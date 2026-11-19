@@ -1825,6 +1825,18 @@ DEFAULT_CONFIG = {
         # cron.scheduler.DEFAULT_FAILURE_REPEAT_ALERT_HOURS.
         "failure_repeat_alert_hours": 6,
     },
+    # Cross-session coordination (hermes_cli/coordination.py): resource claims, durable
+    # addressed session messages, integration dependencies. One SQLite file under HERMES_HOME
+    # (coordination.db), CAS claims with TTL + pid-liveness recovery; no daemon. Enforcement is
+    # cooperative at Hermes tool boundaries (file writes, terminal cwd, integration releases),
+    # not OS confinement.
+    "coordination": {
+        # Master gate. False disables claim enforcement, coord_* tools and inbox injection.
+        "enabled": True,
+        # Claim time-to-live since the last heartbeat; expired claims are reclaimable even if
+        # the owner pid is alive (wedged-worker recovery, kanban #29747 pattern).
+        "claim_ttl_seconds": 900,
+    },
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.

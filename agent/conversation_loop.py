@@ -1838,6 +1838,15 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    # G1 checkpoint: renew owned coordination claims so they do not expire under a
+    # live owner. Inbox messages are delivered as an untrusted peer note at the next
+    # tool batch (apply_pending_steer_to_tool_results), never via the user-authority
+    # steer channel. Fail-open.
+    try:
+        from agent.coordination_inbox import heartbeat_claims
+        heartbeat_claims(agent)
+    except Exception:
+        pass
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):
