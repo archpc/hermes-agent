@@ -772,6 +772,23 @@ def _resolve_or_none(filepath: str, task_id: str, *, entry: bool = False) -> str
         return None
 
 
+def _check_resource_claims(paths: list[str], session_id: str | None) -> str | None:
+    """Cross-session ownership gate (G2): refuse writes into resources another live
+    session owns; auto-claim unclaimed linked worktrees for the first writer.
+    Fail-open on coordination errors — a broken registry must not wedge writes."""
+    try:
+        from hermes_cli import coordination
+        for p in paths:
+            if not p:
+                continue
+            refusal = coordination.check_write_boundary(p, session_id)
+            if refusal:
+                return refusal
+    except Exception:
+        logger.debug("coordination write-boundary check failed (fail-open)", exc_info=True)
+    return None
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
                           cross_profile: bool) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
@@ -878,6 +895,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
            or _check_approval_required_write([path], task_id)
+           or _check_resource_claims([path], session_id)
            or (None if cross_profile else _check_cross_profile_path(path, task_id)))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
@@ -980,6 +998,8 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
         _content_write_paths += collected[1]
         _entry_paths = collected[2]
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
+    if not precheck_err:
+        precheck_err = _check_resource_claims(_paths_to_check, session_id)
     if precheck_err:
         return tool_error(precheck_err)
     try:

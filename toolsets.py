@@ -30,6 +30,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # Cross-session coordination (hermes_cli/coordination.py), gated by coordination.enabled.
+    "coord_claim", "coord_release", "coord_status",
+    "coord_send", "coord_inbox", "coord_sessions", "coord_depend",
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
@@ -159,6 +162,14 @@ TOOLSETS = {
         "block for human input, heartbeat during long ops, comment on threads, attach "
         "files, and (for orchestrators) list, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
+    ),
+    "coordination": _ts(
+        "Cross-session coordination — resource claims (exclusive ownership of shared paths and "
+        "integration targets), durable addressed session-to-session messages with delivery/ack "
+        "and dedup, and integration dependencies with revalidation. Active when "
+        "coordination.enabled (default true). Cooperative Hermes tool-boundary enforcement, "
+        "not OS confinement; see hermes_cli/coordination.py.",
+        [t for t in _HERMES_CORE_TOOLS if t.startswith("coord_")],
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),

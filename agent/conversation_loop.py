@@ -1838,6 +1838,13 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
+    # G1 checkpoint: take delivery of cross-session inbox messages into the steer buffer
+    # (fail-open; delivered via the existing out-of-band path after the first tool batch).
+    try:
+        from agent.coordination_inbox import drain_into_steer
+        drain_into_steer(agent)
+    except Exception:
+        pass
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with native_turn_images(user_message):

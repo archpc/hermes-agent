@@ -1443,6 +1443,13 @@ def _run_foreground(
                 mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
                 env=env,
             )
+            # G2 ownership gate: a working directory owned by another live session is
+            # refused before execution (local backend only; remote backends cannot see
+            # host worktrees). Fail-open on coordination errors inside the check.
+            if env_type == "local":
+                from hermes_cli import coordination
+                if refusal := coordination.check_cwd_boundary(command_cwd, session_id):
+                    return _error_json(refusal)
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.

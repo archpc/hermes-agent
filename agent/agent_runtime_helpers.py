@@ -3686,6 +3686,13 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
+    # G1 mid-turn checkpoint: newly arrived cross-session inbox messages join this
+    # batch's steer delivery (fail-open; CAS drain guarantees exactly-once take).
+    try:
+        from agent.coordination_inbox import drain_into_steer
+        drain_into_steer(agent)
+    except Exception:
+        pass
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
