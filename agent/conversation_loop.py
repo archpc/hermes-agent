@@ -1838,11 +1838,13 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
-    # G1 checkpoint: take delivery of cross-session inbox messages into the steer buffer
-    # (fail-open; delivered via the existing out-of-band path after the first tool batch).
+    # G1 checkpoint: renew owned coordination claims so they do not expire under a
+    # live owner. Inbox messages are delivered as an untrusted peer note at the next
+    # tool batch (apply_pending_steer_to_tool_results), never via the user-authority
+    # steer channel. Fail-open.
     try:
-        from agent.coordination_inbox import drain_into_steer
-        drain_into_steer(agent)
+        from agent.coordination_inbox import heartbeat_claims
+        heartbeat_claims(agent)
     except Exception:
         pass
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so

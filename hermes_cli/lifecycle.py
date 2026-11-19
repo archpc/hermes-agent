@@ -111,5 +111,14 @@ def finalize_session(**kwargs: Any) -> list[Any]:
             )
         except Exception:
             logger.warning("Core Relay session finalization failed", exc_info=True)
+        # G2: release resource claims this session owns and prune dead rows so a
+        # closing session does not hold worktrees/paths hostage (fail-open).
+        try:
+            from hermes_cli import coordination
+            if coordination.enabled():
+                coordination.release_owned_claims(session_id)
+                coordination.prune_dead_claims()
+        except Exception:
+            logger.debug("coordination session cleanup failed (fail-open)", exc_info=True)
 
     return _plugin_hooks("on_session_finalize", **kwargs)

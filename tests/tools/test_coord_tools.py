@@ -89,6 +89,26 @@ class TestCoordTools:
         bad = _call("coord_depend", {"resource": str(repo), "base_sha": head}, "sess-dep")
         assert not bad["ok"]
 
+    def test_worktree_claim_releasable_via_wt_prefix(self, worktree):
+        _repo, wt = worktree
+        # auto-claim by writing, then release via wt:<path> (finding 5).
+        co.claim(co.worktree_key(str(wt)), "worktree", "sess-a")
+        bad = _call("coord_release", {"resource": str(wt)}, "sess-a")  # path: key, not wt:
+        assert not bad["ok"]
+        ok = _call("coord_release", {"resource": f"wt:{wt}"}, "sess-a")
+        assert ok["ok"]
+        assert co.get_claim(co.worktree_key(str(wt))) is None
+
+    def test_coord_heartbeat_renews_all(self, _home):
+        _call("coord_claim", {"resource": str(_home / "a")}, "sess-a")
+        _call("coord_claim", {"resource": str(_home / "b")}, "sess-a")
+        r = _call("coord_heartbeat", {}, "sess-a")
+        assert r["ok"] and r["renewed"] == 2
+        single = _call("coord_heartbeat", {"resource": str(_home / "a")}, "sess-a")
+        assert single["ok"]
+        not_owner = _call("coord_heartbeat", {"resource": str(_home / "a")}, "sess-b")
+        assert not not_owner["ok"]
+
     def test_gate_disables_tools(self, monkeypatch):
         monkeypatch.setattr(co, "coordination_config", lambda: {"enabled": False})
         assert coord_tools._gate() is False
@@ -96,8 +116,8 @@ class TestCoordTools:
     def test_toolset_membership(self):
         import toolsets
         names = [t for t in toolsets._HERMES_CORE_TOOLS if t.startswith("coord_")]
-        assert set(names) == {"coord_claim", "coord_release", "coord_status", "coord_send",
-                              "coord_inbox", "coord_sessions", "coord_depend"}
+        assert set(names) == {"coord_claim", "coord_release", "coord_status", "coord_heartbeat",
+                              "coord_send", "coord_inbox", "coord_sessions", "coord_depend"}
         assert toolsets.TOOLSETS["coordination"]["tools"] == names
 
 

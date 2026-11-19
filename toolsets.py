@@ -31,7 +31,7 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Cross-session coordination (hermes_cli/coordination.py), gated by coordination.enabled.
-    "coord_claim", "coord_release", "coord_status",
+    "coord_claim", "coord_release", "coord_status", "coord_heartbeat",
     "coord_send", "coord_inbox", "coord_sessions", "coord_depend",
     "computer_use",
     # Service-gated connector account status and authorization links.
