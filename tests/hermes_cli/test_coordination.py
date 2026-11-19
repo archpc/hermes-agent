@@ -327,3 +327,91 @@ class TestSnapshot:
         monkeypatch.setattr(co, "coordination_config", lambda: {"claim_ttl_seconds": 7})
         res = co.claim("path:/x", "path", "s")
         assert abs(res["expires_at"] - time.time() - 7) < 2
+
+
+# ── adversarial-review regression fixes ────────────────────────────────
+
+class TestReviewFixes:
+    def test_dedup_is_per_sender(self):
+        # Same semantic key from two senders must NOT swallow the second (finding 4).
+        a = co.send_message("sess-A", "sess-R", "from A", dedup_key="gate-green")
+        b = co.send_message("sess-B", "sess-R", "from B", dedup_key="gate-green")
+        assert a["ok"] and b["ok"]
+        assert not b.get("duplicate") and b["id"] != a["id"]
+        bodies = sorted(m["body"] for m in co.drain_inbox("sess-R"))
+        assert bodies == ["from A", "from B"]
+        # same sender + same key still dedups
+        a2 = co.send_message("sess-A", "sess-R", "retry", dedup_key="gate-green")
+        assert a2["duplicate"] and a2["id"] == a["id"]
+
+    def test_worktree_root_walks_up_nonexistent_dirs(self, worktree):
+        # First write into a fresh nested subdir must still hit the worktree claim (finding 6).
+        co.claim(co.worktree_key(str(worktree)), "worktree", "sess-a")
+        deep = str(worktree / "newdir" / "deep" / "f.txt")
+        refusal = co.check_write_boundary(deep, "sess-b")
+        assert refusal and "sess-a" in refusal
+
+    def test_heartbeat_owned_claims_renews_integration(self):
+        # Integration claims are not renewed by write-boundary; heartbeat_owned must (finding 3).
+        key = co.integration_key("/repo", "main")
+        co.claim(key, "integration", "sess-a", ttl_seconds=0.3)
+        time.sleep(0.2)
+        n = co.heartbeat_owned_claims("sess-a", ttl_seconds=5)
+        assert n == 1
+        held = co.get_claim(key)
+        assert held and held["expires_at"] > time.time() + 4
+        # a live owner is no longer stolen at the original TTL
+        assert not co.claim(key, "integration", "sess-b")["ok"]
+
+    def test_release_owned_claims_on_close(self, worktree):
+        co.claim(co.worktree_key(str(worktree)), "worktree", "sess-a")
+        co.claim("path:/shared", "path", "sess-a")
+        co.claim(co.integration_key("/repo", "main"), "integration", "sess-a")
+        n = co.release_owned_claims("sess-a")
+        assert n == 3
+        assert co.active_claims() == []
+        # integration released as abandoned, never merged
+        snap = co.snapshot()
+        assert all(c["owner_session"] != "sess-a" for c in snap["claims"])
+
+    def test_prune_dead_claims(self):
+        co.claim("path:/dead", "path", "sess-a", ttl_seconds=0.05)
+        c = co._connect()
+        try:
+            c.execute("UPDATE claims SET owner_pid=? WHERE resource_key=?", (2**22 + 777, "path:/dead"))
+            c.commit()
+        finally:
+            c.close()
+        time.sleep(0.1)
+        n = co.prune_dead_claims()
+        assert n >= 1
+        assert co.get_claim("path:/dead") is None
+
+    def test_snapshot_does_not_create_store(self, _home):
+        # Read-only view must not create coordination.db (finding 8).
+        assert not co.db_path().exists()
+        snap = co.snapshot()
+        assert snap["claims"] == [] and snap["messages"] == []
+        assert not co.db_path().exists()
+
+    def test_enabled_parses_string_falsey(self, monkeypatch):
+        for off in ("false", "0", "no", "off", "FALSE"):
+            monkeypatch.setattr(co, "coordination_config", lambda v=off: {"enabled": v})
+            assert co.enabled() is False
+        monkeypatch.setattr(co, "coordination_config", lambda: {"enabled": "true"})
+        assert co.enabled() is True
+
+    def test_delegated_child_bypasses_ownership(self, worktree, monkeypatch):
+        # delegate_task children inherit the parent's claim (finding 2).
+        co.claim(co.worktree_key(str(worktree)), "worktree", "parent-sess")
+        import agent.delegation_context as dc
+        monkeypatch.setattr(dc, "is_delegated_child_process_context", lambda: True)
+        assert co.check_write_boundary(str(worktree / "f.txt"), "child-sess") is None
+        assert co.check_cwd_boundary(str(worktree), "child-sess") is None
+
+    def test_option_like_branch_rejected(self, repo):
+        key = co.integration_key(str(repo), "--git-dir=/tmp/evil")
+        co.register_dependency("sess-dep", key, "abc")
+        # option-like branch must not be evaluated against git (finding 10)
+        assert co.check_integration_revalidation(key, "sess-dep") is None
+

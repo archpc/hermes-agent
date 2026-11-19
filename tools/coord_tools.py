@@ -30,12 +30,15 @@ def _owner(kw: dict) -> str:
 
 
 def _parse_resource(resource: str) -> tuple[str, str]:
-    """'repo:<path>#integrate:<branch>' -> integration key; anything else -> path key."""
+    """'repo:<path>#integrate:<branch>' -> integration key; 'wt:<path>' -> worktree
+    key (so auto-claimed worktrees are releasable); anything else -> path key."""
     from hermes_cli import coordination
     text = (resource or "").strip()
     if text.startswith("repo:") and "#integrate:" in text:
         repo, branch = text[5:].split("#integrate:", 1)
         return coordination.integration_key(os.path.expanduser(repo), branch), "integration"
+    if text.startswith("wt:"):
+        return coordination.worktree_key(os.path.expanduser(text[3:])), "worktree"
     return coordination.path_key(os.path.expanduser(text)), "path"
 
 
@@ -83,6 +86,19 @@ def _coord_status(args: dict, **kw) -> str:
         "inbox_recent": [{k: m[k] for k in ("id", "sender_session", "kind", "created_at", "delivered_at")}
                          for m in inbox],
     }, ensure_ascii=False)
+
+
+def _coord_heartbeat(args: dict, **kw) -> str:
+    from hermes_cli import coordination
+    owner = _owner(kw)
+    resource = str(args.get("resource") or "").strip()
+    if resource:
+        key, _kind = _parse_resource(resource)
+        ok = coordination.heartbeat(key, owner)
+        return json.dumps({"ok": ok, "resource_key": key,
+                           **({} if ok else {"error": "not an active claim you own"})})
+    n = coordination.heartbeat_owned_claims(owner)
+    return json.dumps({"ok": True, "renewed": n})
 
 
 def _coord_send(args: dict, **kw) -> str:
@@ -179,6 +195,17 @@ registry.register(
                    "and inbox summary. Read-only.",
                    {}, []),
     handler=_coord_status, check_fn=_gate, emoji="📋")
+
+registry.register(
+    name="coord_heartbeat", toolset="coordination",
+    schema=_schema("coord_heartbeat",
+                   "Renew your resource claims so they do not expire while you work. With no "
+                   "resource, renews ALL claims you own (path, worktree, integration); with a "
+                   "resource, renews just that one. Claims are also renewed automatically at turn "
+                   " checkpoints; call this during long operations between turns.",
+                   {"resource": {"type": "string", "description": "optional: a path, wt:<path>, or repo:<path>#integrate:<branch>"}},
+                   []),
+    handler=_coord_heartbeat, check_fn=_gate, emoji="💓")
 
 registry.register(
     name="coord_send", toolset="coordination",

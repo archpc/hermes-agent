@@ -5,6 +5,7 @@ same isolated HERMES_HOME — no mocked single-process shortcuts.
 """
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -74,6 +75,23 @@ def _json_out(proc, timeout=60):
     return json.loads(out.strip().splitlines()[-1])
 
 
+def _readline_json(proc, timeout=30):
+    """Read one JSON line with a timeout so a child that dies before printing
+    fails the test instead of hanging it (finding: unbounded readline)."""
+    assert proc.stdout is not None
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        if not sel.select(timeout):
+            raise AssertionError(f"child did not print a result within {timeout}s")
+        line = proc.stdout.readline()
+        if not line:
+            raise AssertionError("child exited before printing a result")
+        return json.loads(line)
+    finally:
+        sel.close()
+
+
 class TestClaimRaces:
     def test_eight_processes_one_winner(self, _home):
         # Holders stay alive for the whole race: a claim-and-exit driver would
@@ -82,8 +100,7 @@ class TestClaimRaces:
         try:
             results = []
             for p in procs:
-                assert p.stdout is not None
-                results.append(json.loads(p.stdout.readline()))
+                results.append(_readline_json(p))
             winners = [r for r in results if r.get("ok")]
             losers = [r for r in results if not r.get("ok")]
             assert len(winners) == 1, results
@@ -109,8 +126,7 @@ class TestClaimRaces:
 
     def test_killed_owner_reclaimed(self, _home):
         child = _spawn(_CLAIM_HOLD_DRIVER, _home, "path:/kill", "sess-killed")
-        assert child.stdout is not None
-        first = json.loads(child.stdout.readline())
+        first = _readline_json(child)
         assert first["ok"]
         os.kill(child.pid, signal.SIGKILL)
         child.wait(timeout=10)
@@ -120,9 +136,8 @@ class TestClaimRaces:
 
     def test_live_owner_not_reclaimed(self, _home):
         child = _spawn(_CLAIM_HOLD_DRIVER, _home, "path:/live", "sess-live")
-        assert child.stdout is not None
         try:
-            assert json.loads(child.stdout.readline())["ok"]
+            assert _readline_json(child)["ok"]
             res = co.claim("path:/live", "path", "sess-other")
             assert not res["ok"] and res["conflict"]["reason"] == "owner-live"
         finally:

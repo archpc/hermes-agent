@@ -12,9 +12,12 @@ Scope (honest boundaries):
   shell commands, direct SQLite writers, and processes outside Hermes are NOT
   confined; this is not OS isolation.
 - Messages are durable and addressed to a session id. Delivery happens when the
-  recipient session next drains its inbox at a turn checkpoint (at-least-once with
-  recipient-side CAS dedup). An idle session that never takes another turn keeps its
-  mail queued; nothing is lost, nothing is pushed.
+  recipient session next drains its inbox at a turn checkpoint. The drain CAS makes
+  the TAKE exactly-once across concurrent drains; delivery into model context is
+  at-most-once (a hard interrupt that wipes the steer buffer after a drain can drop
+  the notice from context — it remains visible via coord_inbox, marked delivered).
+  An idle session that never takes another turn keeps its mail queued; nothing is
+  lost from the store, nothing is pushed.
 - Acknowledgment is a state transition on the message row (delivered/acked), never a
   return message — there is no acknowledgment recursion.
 """
@@ -62,7 +65,7 @@ CREATE TABLE IF NOT EXISTS claim_events (
 CREATE INDEX IF NOT EXISTS idx_claim_events_key ON claim_events(resource_key, id);
 CREATE TABLE IF NOT EXISTS messages (
     id              TEXT PRIMARY KEY,
-    dedup_key       TEXT UNIQUE,
+    dedup_key       TEXT,
     sender_session  TEXT NOT NULL,
     sender_pid      INTEGER,
     recipient_session TEXT NOT NULL,
@@ -71,7 +74,10 @@ CREATE TABLE IF NOT EXISTS messages (
     in_reply_to     TEXT,
     created_at      REAL NOT NULL,
     delivered_at    REAL,
-    acked_at        REAL
+    acked_at        REAL,
+    -- Dedup is per-sender: a semantic key like 'gate-green' used by two sessions
+    -- must not swallow the second sender's message (finding: cross-sender collision).
+    UNIQUE(sender_session, dedup_key)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_session, delivered_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_session, created_at);
@@ -102,9 +108,13 @@ def coordination_config() -> dict[str, Any]:
 
 def enabled() -> bool:
     """Master gate (config coordination.enabled, default True). Fail-open on config
-    errors: a broken config read must not wedge tool execution."""
+    errors: a broken config read must not wedge tool execution. Parses string
+    falsey spellings explicitly so 'false'/'0'/'no' actually disable it."""
     try:
-        return bool(coordination_config().get("enabled", True))
+        raw = coordination_config().get("enabled", True)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("0", "false", "off", "no", "")
+        return bool(raw)
     except Exception:
         return True
 
@@ -130,10 +140,36 @@ def _connect(path: Optional[Path] = None) -> sqlite3.Connection:
     target.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(_SCHEMA)
+    # The WAL transition needs a momentary exclusive lock and can raise
+    # "database is locked" under concurrent first-use even with busy_timeout set
+    # (the busy handler is not invoked for journal_mode changes). Retry until one
+    # process completes the transition; afterwards journal_mode=WAL is a no-op.
+    last_err: Optional[Exception] = None
+    for attempt in range(50):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.executescript(_SCHEMA)
+            return conn
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last_err = exc
+            time.sleep(0.02 * (attempt + 1))
+    raise last_err if last_err else sqlite3.OperationalError("coordination store init failed")
+
+
+def _connect_ro() -> Optional[sqlite3.Connection]:
+    """Read-only connection for the view path: never creates the DB, never runs
+    DDL or journal-mode PRAGMA (finding: snapshot must not mutate). None when the
+    store does not exist yet."""
+    target = db_path()
+    if not target.exists():
+        return None
+    conn = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -325,6 +361,78 @@ def heartbeat(resource_key: str, owner_session: str, *,
             c.close()
 
 
+def heartbeat_owned_claims(owner_session: str, *, ttl_seconds: Optional[float] = None) -> int:
+    """Renew EVERY active claim this session owns (path, worktree, integration).
+
+    Explicit claims (path/integration) are not renewed by the write-boundary
+    auto-heartbeat, so without this a live owner loses them at TTL (finding:
+    unreachable heartbeat). Called at turn checkpoints and via coord_heartbeat.
+    Returns the number of claims renewed."""
+    ttl = float(ttl_seconds) if ttl_seconds and ttl_seconds > 0 else claim_ttl_seconds()
+    now = time.time()
+    c = _connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE claims SET heartbeat_at=?, expires_at=? "
+            "WHERE released_at IS NULL AND owner_session=?",
+            (now, now + ttl, owner_session))
+        c.commit()
+        return cur.rowcount
+    finally:
+        c.close()
+
+
+def release_owned_claims(owner_session: str, *, outcome: str = "session-closed") -> int:
+    """Release every active claim a session owns (session-end cleanup). Integration
+    claims are released WITHOUT a merged outcome (no evidence implied). Returns count."""
+    now = time.time()
+    c = _connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE claims SET released_at=?, release_outcome=? "
+            "WHERE released_at IS NULL AND owner_session=? AND kind != 'integration'",
+            (now, outcome, owner_session))
+        # Integration claims need explicit evidence-gated release; mark them abandoned
+        # on session close so they do not linger, but never claim 'merged'.
+        cur2 = c.execute(
+            "UPDATE claims SET released_at=?, release_outcome='abandoned' "
+            "WHERE released_at IS NULL AND owner_session=? AND kind = 'integration'",
+            (now, owner_session))
+        c.commit()
+        return cur.rowcount + cur2.rowcount
+    finally:
+        c.close()
+
+
+def prune_dead_claims() -> int:
+    """Delete claim rows whose owner is provably dead AND past TTL, plus released
+    rows older than a retention window. Bounds table growth and the per-write scan
+    cost (finding: unbounded growth). Returns rows deleted."""
+    now = time.time()
+    retention = 7 * 86400.0
+    c = _connect()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute(
+            "SELECT resource_key, owner_pid, owner_start, expires_at FROM claims "
+            "WHERE released_at IS NULL").fetchall()
+        dead_keys = []
+        for r in rows:
+            if now >= float(r["expires_at"]) and _owner_alive(int(r["owner_pid"]), float(r["owner_start"])) is False:
+                dead_keys.append(r["resource_key"])
+        n = 0
+        for key in dead_keys:
+            n += c.execute("DELETE FROM claims WHERE resource_key=? AND released_at IS NULL", (key,)).rowcount
+        n += c.execute("DELETE FROM claims WHERE released_at IS NOT NULL AND released_at < ?",
+                       (now - retention,)).rowcount
+        c.commit()
+        return n
+    finally:
+        c.close()
+
+
 def release(resource_key: str, owner_session: str, *, outcome: str = "released",
             evidence: Optional[dict] = None,
             conn: Optional[sqlite3.Connection] = None) -> dict[str, Any]:
@@ -452,6 +560,14 @@ def _worktree_root(path: str) -> Optional[str]:
     import subprocess
     try:
         candidate = path if os.path.isdir(path) else os.path.dirname(path)
+        # Walk up to the nearest EXISTING ancestor: write_file creates directories
+        # as needed, so a first write into a fresh nested subdir must still resolve
+        # its worktree root (finding: non-existent-parent bypass).
+        while candidate and not os.path.isdir(candidate):
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
         if not candidate or not os.path.isdir(candidate):
             return None
         now = time.time()
@@ -492,6 +608,16 @@ def check_write_boundary(path: str, session_id: Optional[str], *,
     """
     if not enabled():
         return None
+    # Delegated children (delegate_task / kanban workers) act under their parent's
+    # workspace authority and share its claim; enforcing a distinct per-child owner
+    # would make parent and children race for one worktree (finding: delegation
+    # regression). Children inherit the parent's ownership instead.
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+        if is_delegated_child_process_context():
+            return None
+    except Exception:
+        pass
     owner = session_identity(session_id)
     try:
         target = os.path.realpath(path)
@@ -569,17 +695,29 @@ def send_message(sender_session: str, recipient_session: str, body: str, *,
     try:
         c.execute("BEGIN IMMEDIATE")
         if dedup_key:
-            prior = c.execute("SELECT id FROM messages WHERE dedup_key=?", (dedup_key,)).fetchone()
+            prior = c.execute("SELECT id FROM messages WHERE sender_session=? AND dedup_key=?",
+                              (sender_session, dedup_key)).fetchone()
             if prior:
                 c.rollback()
                 return {"ok": True, "id": prior["id"], "duplicate": True}
-        c.execute(
-            "INSERT INTO messages (id, dedup_key, sender_session, sender_pid, recipient_session, "
-            "kind, body, in_reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (mid, dedup_key, sender_session, os.getpid(), recipient_session, kind,
-             str(body), in_reply_to, now))
-        c.commit()
-        return {"ok": True, "id": mid, "duplicate": False}
+        try:
+            c.execute(
+                "INSERT INTO messages (id, dedup_key, sender_session, sender_pid, recipient_session, "
+                "kind, body, in_reply_to, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (mid, dedup_key, sender_session, os.getpid(), recipient_session, kind,
+                 str(body), in_reply_to, now))
+            c.commit()
+            return {"ok": True, "id": mid, "duplicate": False}
+        except sqlite3.IntegrityError:
+            # Concurrent same-(sender, dedup_key) insert lost the UNIQUE race: the
+            # winner's row is the canonical one. Report it as a duplicate, never crash.
+            c.rollback()
+            if dedup_key:
+                prior = c.execute("SELECT id FROM messages WHERE sender_session=? AND dedup_key=?",
+                                  (sender_session, dedup_key)).fetchone()
+                if prior:
+                    return {"ok": True, "id": prior["id"], "duplicate": True}
+            raise
     except Exception:
         try:
             c.rollback()
@@ -726,6 +864,10 @@ def check_integration_revalidation(key: str, claimant_session: str) -> Optional[
     if parsed is None:
         return None
     repo, branch = parsed
+    # A model-controlled branch must not be parsed as a git option (finding: argv
+    # option injection). Reject option-like / whitespace-bearing names outright.
+    if branch.startswith("-") or any(ch.isspace() for ch in branch):
+        return None
     import subprocess
     try:
         head = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=repo,
@@ -769,20 +911,27 @@ def snapshot(*, include_messages: bool = True, message_limit: int = 20) -> dict[
         out["goals"] = []
         out["goals_error"] = str(exc)
     try:
-        c = _connect()
-        try:
-            out["claims"] = active_claims(conn=c)
-            out["dependencies"] = [dict(r) for r in c.execute(
-                "SELECT * FROM dependencies ORDER BY created_at").fetchall()]
-            out["recent_events"] = [dict(r) for r in c.execute(
-                "SELECT * FROM claim_events ORDER BY id DESC LIMIT 50").fetchall()]
+        c = _connect_ro()
+        if c is None:
+            out["claims"] = []
+            out["dependencies"] = []
+            out["recent_events"] = []
             if include_messages:
-                out["messages"] = [dict(r) for r in c.execute(
-                    "SELECT id, sender_session, recipient_session, kind, created_at, "
-                    "delivered_at, acked_at FROM messages ORDER BY created_at DESC LIMIT ?",
-                    (int(message_limit),)).fetchall()]
-        finally:
-            c.close()
+                out["messages"] = []
+        else:
+            try:
+                out["claims"] = active_claims(conn=c)
+                out["dependencies"] = [dict(r) for r in c.execute(
+                    "SELECT * FROM dependencies ORDER BY created_at").fetchall()]
+                out["recent_events"] = [dict(r) for r in c.execute(
+                    "SELECT * FROM claim_events ORDER BY id DESC LIMIT 50").fetchall()]
+                if include_messages:
+                    out["messages"] = [dict(r) for r in c.execute(
+                        "SELECT id, sender_session, recipient_session, kind, created_at, "
+                        "delivered_at, acked_at FROM messages ORDER BY created_at DESC LIMIT ?",
+                        (int(message_limit),)).fetchall()]
+            finally:
+                c.close()
     except Exception as exc:
         out["coordination_error"] = str(exc)
     return out
